@@ -1,0 +1,279 @@
+# Snakefile for RNA-seq analysis pipeline (with pre-provided reference)
+configfile: "config.yaml"
+
+# --- 从配置文件读取参数 --- 
+WORK_DIR = config["work_dir"]
+THREADS = config["threads"]
+REF_FASTA = config["ref_fasta"]  # 基因组fasta路径
+REF_GTF = config["ref_gtf"]      # 注释文件路径
+REF_PREFIX = config["ref_prefix"]
+
+# 获取所有样本列表
+ALL_SAMPLES = [sample for group in config["samples"].values() for sample in group]
+SAMPLES_GROUP = {sample:group for group in config["samples"] for sample in config["samples"][group]}
+GROUP_OF_SAMPLES = [SAMPLES_GROUP[sample] for sample in ALL_SAMPLES]
+GROUP_NAMES = unique_groups = list(dict.fromkeys(GROUP_OF_SAMPLES))
+print(GROUP_NAMES)
+
+# --- 定义目录结构 --- 
+dirs = [
+    "00.raw_sra",
+    "01.raw_fastq",
+    "02.clean_fastq",
+    "03.alignment_file/hisat2_result",
+    "04.count_matrix/featureCounts", 
+    "05.DEseq2",
+    "Reference/hisat2_index"
+]
+
+rule all:
+    input:
+        expand("05.DEseq2/{plot}", plot=["merged_count_matrix.txt", "deseq2.diff.csv", "Volcano.plot.pdf"]),
+        "03.alignment_file/heatmap_SpearmanCorr_readCounts.png"
+
+# --- 创建目录结构 --- 
+rule create_dirs:
+    run:
+        import os
+        for d in dirs:
+            os.makedirs(os.path.join(WORK_DIR, d), exist_ok=True)
+
+# --- 数据下载和质控部分保持不变 ---
+rule download_sra:
+    output:
+        "00.raw_sra/{sample}/{sample}.sra"
+    params:
+        outdir = "00.raw_sra"
+    shell:
+        "{config[tools][prefetch]} {wildcards.sample} -O {params.outdir}"
+
+rule sra_to_fastq:
+    input:
+        "00.raw_sra/{sample}/{sample}.sra"
+    output:
+        "01.raw_fastq/{sample}_1.fastq.gz",
+        "01.raw_fastq/{sample}_2.fastq.gz" 
+    shell:
+        "{config[tools][fastq-dump]} {input} --split-3 --gzip -O 01.raw_fastq"
+
+# --- FastQC原始数据质控 --- 
+rule raw_fastqc:
+    input:
+        "01.raw_fastq/{sample}_{pair}.fastq.gz"
+    output:
+        "01.raw_fastq/{sample}_{pair}_fastqc.html"
+    shell:
+        "{config[tools][fastqc]} {input} -o 01.raw_fastq -t {THREADS}"
+
+# --- MultiQC汇总报告 --- 
+rule raw_multiqc:
+    input:
+        expand("01.raw_fastq/{sample}_{pair}_fastqc.html", 
+               sample=ALL_SAMPLES, pair=["1", "2"])
+    output:
+        "01.raw_fastq/multiqc_report.html"
+    shell:
+        "{config[tools][multiqc]} 01.raw_fastq/ -o 01.raw_fastq"
+
+# --- Fastp数据清洗 --- 
+rule fastp_clean:
+    input:
+        r1 = "01.raw_fastq/{sample}_1.fastq.gz",
+        r2 = "01.raw_fastq/{sample}_2.fastq.gz"
+    output:
+        cr1 = "02.clean_fastq/{sample}_1.fastq.gz",
+        cr2 = "02.clean_fastq/{sample}_2.fastq.gz",
+        html = "02.clean_fastq/{sample}.fastp.html",
+        json = "02.clean_fastq/{sample}.fastp.json"
+    shell:
+        "{config[tools][fastp]} -i {input.r1} -I {input.r2} "
+        "-o {output.cr1} -O {output.cr2} "
+        "-h {output.html} -j {output.json} "
+        "--thread 4"
+
+# --- 清洗后质控 --- 
+rule clean_fastqc:
+    input:
+        "02.clean_fastq/{sample}_{pair}.fastq.gz"
+    output:
+        "02.clean_fastq/{sample}_{pair}_fastqc.html"
+    shell:
+        "{config[tools][fastqc]} {input} -o 02.clean_fastq -t {THREADS}"
+
+rule clean_multiqc:
+    input:
+        expand("02.clean_fastq/{sample}_{pair}_fastqc.html", 
+               sample=ALL_SAMPLES, pair=["1", "2"])
+    output:
+        "02.clean_fastq/multiqc_report.html"
+    shell:
+        "{config[tools][multiqc]} 02.clean_fastq/ -o 02.clean_fastq"
+
+# --- 参考基因组处理 ---
+print(REF_FASTA)
+rule hisat2_index:
+    input:
+        REF_FASTA
+    output:
+        expand("Reference/hisat2_index/{prefix}.{n}.ht2",
+               prefix=config["ref_prefix"], n=range(1,9))
+    shell:
+        "{config[tools][hisat2]}-build -p {THREADS} {config[ref_fasta]} Reference/hisat2_index/{config[ref_prefix]}"
+
+# --- 比对和定量 ---
+rule hisat2_align:
+    input:
+        r1 = "02.clean_fastq/{sample}_1.fastq.gz",
+        r2 = "02.clean_fastq/{sample}_2.fastq.gz",
+        idx = expand("Reference/hisat2_index/{prefix}.{n}.ht2",
+                   prefix=config["ref_prefix"], n=range(1,9))
+    output:
+        sam = "03.alignment_file/hisat2_result/{sample}.hisat2.sam",
+        summary = "03.alignment_file/hisat2_result/{sample}.hisat2.summary"
+    shell:
+        "{config[tools][hisat2]} -x Reference/hisat2_index/{config[ref_prefix]} "
+        "-1 {input.r1} -2 {input.r2} "
+        "-S {output.sam} -p 4 "
+        "--summary-file {output.summary}"
+
+rule sam_to_bam:
+    input:
+        sam = "03.alignment_file/hisat2_result/{sample}.hisat2.sam"
+    output:
+        bam = "03.alignment_file/hisat2_result/{sample}.hisat2.sort.bam",
+        bai = "03.alignment_file/hisat2_result/{sample}.hisat2.sort.bam.bai"  # 索引文件
+    params:
+        unsorted_bam = "03.alignment_file/hisat2_result/{sample}.hisat2.bam"  # 中间文件
+    shell:
+        """
+        # 1. SAM转BAM
+        {config[tools][samtools]} view -@ 4 -bS {input.sam} > {params.unsorted_bam}
+        
+        # 2. 排序BAM
+        {config[tools][samtools]} sort -@ 4 {params.unsorted_bam} -o {output.bam}
+        
+        # 3. 删除中间文件
+        rm -v {params.unsorted_bam} {input.sam}
+        
+        # 4. 创建索引
+        {config[tools][samtools]} index {output.bam}
+        """
+
+rule feature_counts:
+    input:
+        bam = "03.alignment_file/hisat2_result/{sample}.hisat2.sort.bam",
+        gtf = REF_GTF
+    output:
+        counts = "04.count_matrix/featureCounts/{sample}.featurecount.txt"
+    shell:
+        "{config[tools][featurecounts]} -a {input.gtf} -o {output.counts} "
+        "-p {input.bam}"
+
+# --- 样本相关性分析 ---
+rule sample_correlation:
+    input:
+        bams = expand("03.alignment_file/hisat2_result/{sample}.hisat2.sort.bam", sample=ALL_SAMPLES)
+    output:
+        "03.alignment_file/heatmap_SpearmanCorr_readCounts.png",
+        "03.alignment_file/readCounts.npz",
+        "03.alignment_file/readCounts.tab"
+    params:
+        labels = lambda wildcards: " ".join(
+            [f"{group}_rep{i+1}" 
+             for group in config["samples"] 
+             for i, sample in enumerate(config["samples"][group])]
+    )
+    shell:
+        "{config[tools][multiBamSummary]} bins --bamfiles {input.bams} "
+        "--minMappingQuality 30 --labels {params.labels} "
+        "-out {output[1]} --outRawCounts {output[2]} "
+        "-p {THREADS} "
+        "{config[tools][plotCorrelation]} -in {output[1]} --corMethod spearman "
+        "--skipZeros --plotTitle 'Spearman Correlation of Read Counts' "
+        "--whatToPlot heatmap --colorMap RdYlBu --plotNumbers "
+        "-o {output[0]}"
+
+# --- DESeq2差异分析 --- 
+rule merged_deseq2_analysis:
+    input:
+        counts = expand("04.count_matrix/featureCounts/{sample}.featurecount.txt", sample=ALL_SAMPLES),
+        gtf = REF_GTF
+    output:
+        merged_count_txt = "05.DEseq2/merged_count_matrix.txt",
+        diff_csv = "05.DEseq2/deseq2.diff.csv",
+        volcano = "05.DEseq2/Volcano.plot.pdf"
+    run:
+        # 准备分组信息
+        group_data = []
+        for group_name, samples in config["samples"].items():
+            group_data.extend([f"'{s}':'{group_name}'" for s in samples])
+        
+        # 将列表转换为字符串
+        sample_str = ','.join([f"'{s}'" for s in ALL_SAMPLES])
+        group_str = ','.join([f"'{g}'" for g in GROUP_OF_SAMPLES])
+        group_class_str =  ','.join([f"'{c}'" for c in GROUP_NAMES])
+        
+        # 生成R脚本
+        script = f"""
+library(purrr)
+suppressMessages(library(DESeq2))
+library(ggplot2)
+library(tibble)
+
+samplelist <- c({sample_str})
+grouplist <- c({group_str})
+
+exprlist <- lapply(samplelist, function(x){{
+     expr <- read.table(paste0('04.count_matrix/featureCounts/', x, '.featurecount.txt'), header=T)
+     expr<- expr[,c(1,7)] 
+     colnames(expr) <- c('GeneID', x) 
+     expr
+}})
+
+expr.mat <- purrr::reduce(exprlist, function(x,y){{merge(x,y, by="GeneID", all.x=T)}})
+write.table(expr.mat, 
+    file = "{output.merged_count_txt}", 
+    sep = "\t", 
+    quote = FALSE, 
+    row.names = FALSE)
+
+group_info <- data.frame(Sample=samplelist, Group=grouplist) 
+print(group_info)
+expr <- column_to_rownames(expr.mat, "GeneID")
+head(expr)
+colData <- group_info 
+colData$Group <- factor(colData$Group, levels = c({group_class_str}))
+dds <- DESeqDataSetFromMatrix(countData = as.matrix(expr), colData = colData, design = ~Group)
+dds <- dds[rowSums(counts(dds)) > 10, ] 
+dds <- DESeq(dds) 
+print(resultsNames(dds)) 
+print(dds)
+res <- results(dds) 
+head(res) 
+write.csv(res, "{output.diff_csv}")
+
+res.plot <- data.frame(res, stringsAsFactors = FALSE, check.names = FALSE)
+res.plot <- na.omit(res.plot)
+res.plot$gene <- rownames(res.plot)
+res.plot$sig <- "Not Signaficant"
+res.plot[res.plot$log2FoldChange > 1 & res.plot$padj < 0.05, ]$sig <- "Highly expression in met1"
+res.plot[res.plot$log2FoldChange < -1 & res.plot$padj < 0.05, ]$sig <- "Highly expression in CK"
+res.plot$label <- ifelse(res.plot$padj < 10e-100 & abs(res.plot$log2FoldChange) >= 5,
+                        rownames(res.plot), "")
+p <- ggplot(data=res.plot, aes(x=log2FoldChange,y= -log10(padj))) +
+  geom_point(aes(color=sig)) + 
+  geom_text(aes(label=label),  nudge_x=.5,nudge_y=.5, size=2.5) +
+  scale_color_manual(values=c("#546de5", "#ff4757", "#d2dae2")) + 
+  labs(x=expression(log[2](FC)), y=expression(-log[10](padj))) +
+  geom_hline(yintercept=2, linetype=4) +
+  geom_vline(xintercept=c(-2, 2),linetype=4) +
+  theme_bw() + theme(panel.grid = element_blank(), 
+  legend.position = "top", legend.title = element_blank(), aspect.ratio=1,
+        legend.background = element_blank())
+
+ggsave("{output.volcano}", p, width=8, height=6)
+"""
+        with open("merged_analysis.R", "w") as f:
+            f.write(script)
+        shell("Rscript merged_analysis.R")
+

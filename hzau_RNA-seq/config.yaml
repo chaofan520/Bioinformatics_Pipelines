@@ -1,0 +1,31 @@
+# config.yaml
+samples:
+  CK:
+    - SRR15859987
+    - SRR15859988 
+    - SRR15859989
+  met1:
+    - SRR15859993
+    - SRR15859994
+    - SRR15859995
+
+# 参考文件配置
+ref_fasta: "../Reference/Arabidopsis_thaliana.TAIR10.dna_sm.toplevel.fa"
+ref_gtf: "../Reference/Arabidopsis_thaliana.TAIR10.61.gtf"
+ref_prefix: "Arabidopsis_thaliana.TAIR10"
+
+work_dir: "."
+threads: 16
+
+# 工具路径配置
+tools:
+  fastqc: "fastqc"
+  multiqc: "multiqc"
+  fastp: "fastp"
+  hisat2: "hisat2"
+  samtools: "samtools"
+  featurecounts: "featureCounts"
+  prefetch: "prefetch"
+  fastq-dump: "fastq-dump"
+  multiBamSummary: "multiBamSummary"
+  plotCorrelation: "plotCorrelation"
