@@ -59,11 +59,17 @@ rule sra_to_fastq:
 # --- FastQC原始数据质控 --- 
 rule raw_fastqc:
     input:
-        "01.raw_fastq/{sample}_{pair}.fastq.gz"
+        raw_fq1 = "01.raw_fastq/{sample}_1.fastq.gz",
+        raw_fq2 = "01.raw_fastq/{sample}_2.fastq.gz"
     output:
-        "01.raw_fastq/{sample}_{pair}_fastqc.html"
+        "01.raw_fastq/{sample}_1_fastqc.html",
+        "01.raw_fastq/{sample}_2_fastqc.html",
+        "01.raw_fastq/{sample}_1_fastqc.zip",
+        "01.raw_fastq/{sample}_2_fastqc.zip"
+
     shell:
-        "{config[tools][fastqc]} {input} -o 01.raw_fastq -t {THREADS}"
+        "{config[tools][fastqc]} {input.raw_fq1} -o 01.raw_fastq -t 1;"
+        "{config[tools][fastqc]} {input.raw_fq2} -o 01.raw_fastq -t 1"
 
 # --- MultiQC汇总报告 --- 
 rule raw_multiqc:
@@ -79,7 +85,8 @@ rule raw_multiqc:
 rule fastp_clean:
     input:
         r1 = "01.raw_fastq/{sample}_1.fastq.gz",
-        r2 = "01.raw_fastq/{sample}_2.fastq.gz"
+        r2 = "01.raw_fastq/{sample}_2.fastq.gz",
+        raw_multiqc = "01.raw_fastq/multiqc_report.html"
     output:
         cr1 = "02.clean_fastq/{sample}_1.fastq.gz",
         cr2 = "02.clean_fastq/{sample}_2.fastq.gz",
@@ -94,11 +101,17 @@ rule fastp_clean:
 # --- 清洗后质控 --- 
 rule clean_fastqc:
     input:
-        "02.clean_fastq/{sample}_{pair}.fastq.gz"
+        clean_fq1 = "02.clean_fastq/{sample}_1.fastq.gz",
+        clean_fq2 = "02.clean_fastq/{sample}_2.fastq.gz"
     output:
-        "02.clean_fastq/{sample}_{pair}_fastqc.html"
+        "02.clean_fastq/{sample}_1_fastqc.html",
+        "02.clean_fastq/{sample}_2_fastqc.html",
+        "02.clean_fastq/{sample}_1_fastqc.zip",
+        "02.clean_fastq/{sample}_2_fastqc.zip"
+
     shell:
-        "{config[tools][fastqc]} {input} -o 02.clean_fastq -t {THREADS}"
+        "{config[tools][fastqc]} {input.clean_fq1} -o 02.clean_fastq -t 1;"
+        "{config[tools][fastqc]} {input.clean_fq2} -o 02.clean_fastq -t 1"
 
 rule clean_multiqc:
     input:
@@ -123,6 +136,7 @@ rule hisat2_index:
 # --- 比对和定量 ---
 rule hisat2_align:
     input:
+        clean_multiqc = "02.clean_fastq/multiqc_report.html",
         r1 = "02.clean_fastq/{sample}_1.fastq.gz",
         r2 = "02.clean_fastq/{sample}_2.fastq.gz",
         idx = expand("Reference/hisat2_index/{prefix}.{n}.ht2",
@@ -187,7 +201,7 @@ rule sample_correlation:
         "{config[tools][multiBamSummary]} bins --bamfiles {input.bams} "
         "--minMappingQuality 30 --labels {params.labels} "
         "-out {output[1]} --outRawCounts {output[2]} "
-        "-p {THREADS} "
+        "-p {THREADS} \n"
         "{config[tools][plotCorrelation]} -in {output[1]} --corMethod spearman "
         "--skipZeros --plotTitle 'Spearman Correlation of Read Counts' "
         "--whatToPlot heatmap --colorMap RdYlBu --plotNumbers "
